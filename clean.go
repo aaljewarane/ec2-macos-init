@@ -4,6 +4,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -31,11 +32,9 @@ var errUtilsNotFound = errors.New(utilsCommandName + " not found")
 // current - This is the option when -all isn't provided. It only removes the current instance's history.
 // all - When -all is provided, all instance history is removed.
 //
-// By default, clean also removes well-known OS state (e.g. the macOS network
-// interface configuration cache) by calling out to ec2-macos-utils. This is
-// required for instances that are cleaned in preparation for imaging (AMI
-// creation). The -init-state-only flag limits cleanup to ec2-macos-init's
-// own state.
+// By default, clean also removes well-known OS state via ec2-macos-utils to
+// ready the system for imaging. The -init-state-only flag limits cleanup to
+// ec2-macos-init's own state.
 func clean(baseDir string, c *ec2macosinit.InitConfig) {
 	// Define flags
 	cleanFlags := flag.NewFlagSet("clean", flag.ExitOnError)
@@ -60,21 +59,23 @@ func clean(baseDir string, c *ec2macosinit.InitConfig) {
 	// Remove OS level state unless limited to init's own state. This must
 	// happen regardless of whether any instance history was present so that
 	// the system is always left ready for imaging.
+	var osStateErr error
 	if *initStateOnly {
 		c.Log.Info("Skipping OS state cleanup (-init-state-only)")
 	} else {
-		c.Log.Infof("Removing OS state with %s", utilsCommandName)
-		err := cleanSystemState()
-		if err != nil {
-			c.Log.Fatalf(1, "Unable to remove OS state (re-run with -init-state-only to skip): %s", err)
+		osStateErr = cleanOSState(c)
+		if osStateErr != nil {
+			c.Log.Errorf("Unable to remove OS state: %s", osStateErr)
 		}
-		c.Log.Info("OS state removal complete")
 	}
 
 	// Fail loud if any part of cleanup did not complete so a partially
 	// cleaned system is never mistaken for one ready for imaging.
 	if historyErr != nil {
 		c.Log.Fatalf(1, "Clean incomplete: unable to remove instance history: %s", historyErr)
+	}
+	if osStateErr != nil {
+		c.Log.Fatalf(1, "Clean incomplete: unable to remove OS state: %s", osStateErr)
 	}
 
 	c.Log.Info("Clean complete")
@@ -117,16 +118,49 @@ func cleanInstanceHistory(baseDir string, c *ec2macosinit.InitConfig, all bool) 
 	return nil
 }
 
-// cleanSystemState invokes ec2-macos-utils to remove well-known OS state
-// (e.g. the macOS network interface configuration cache) from the running
-// system. The subprocess's STDIO is passed through to the calling shell so
-// its output is directly visible to the user.
-func cleanSystemState() error {
+// cleanOSState removes well-known OS state via ec2-macos-utils. For
+// backwards compatibility it warns and returns nil when utils is missing or
+// too old to support 'system cleanup-state' (this may become an error in a
+// future release); a genuine command failure is returned so the caller fails
+// loudly.
+func cleanOSState(c *ec2macosinit.InitConfig) error {
 	utilsPath, err := resolveUtilsCommand()
 	if err != nil {
-		return err
+		c.Log.Warnf("Skipping OS state cleanup: %s", err)
+		c.Log.Warnf("Cached OS state (e.g. NetworkInterfaces.plist) was not removed and may affect "+
+			"instances launched from an image of this system; install %s to enable this cleanup", utilsCommandName)
+		return nil
 	}
 
+	if !utilsSupportsCleanupState(utilsPath) {
+		c.Log.Warnf("Skipping OS state cleanup: installed %s does not support 'system cleanup-state'", utilsCommandName)
+		c.Log.Warnf("Cached OS state (e.g. NetworkInterfaces.plist) was not removed and may affect "+
+			"instances launched from an image of this system; update %s to enable this cleanup", utilsCommandName)
+		return nil
+	}
+
+	c.Log.Infof("Removing OS state with %s", utilsCommandName)
+	if err := cleanSystemState(utilsPath); err != nil {
+		return fmt.Errorf("%s system cleanup-state failed: %w", utilsCommandName, err)
+	}
+	c.Log.Info("OS state removal complete")
+	return nil
+}
+
+// utilsSupportsCleanupState reports whether ec2-macos-utils supports the
+// 'system cleanup-state' subcommand. Probing --help exits zero when the
+// command exists and non-zero on versions predating it, without running the
+// command or its root check.
+func utilsSupportsCleanupState(utilsPath string) bool {
+	cmd := exec.Command(utilsPath, "system", "cleanup-state", "--help")
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	return cmd.Run() == nil
+}
+
+// cleanSystemState invokes ec2-macos-utils to remove OS state, passing its
+// STDIO through to the calling shell so output is visible to the user.
+func cleanSystemState(utilsPath string) error {
 	cmd := exec.Command(utilsPath, "system", "cleanup-state")
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
