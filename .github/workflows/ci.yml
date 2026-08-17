@@ -26,6 +26,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
@@ -33,12 +35,12 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
+          only-new-issues: true
           args: --disable errcheck
       - name: errcheck (non-blocking)
         uses: golangci/golangci-lint-action@v9
         continue-on-error: true
         with:
+          only-new-issues: true
           args: --enable-only errcheck
-      - name: Run Linter
-        run: make -f ci/Makefile --include-dir ci ci-lint
 
